@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from os import PathLike
 from pathlib import Path
 from typing import Sequence
@@ -230,9 +231,16 @@ class Video:
             whether to include the audio layer. Default is ``True``.
     """
 
-    def __init__(self, video_file: str | PathLike, audio: bool = True) -> None:
-        self.video_file = Path(video_file)
-        self._reader = imageio.get_reader(self.video_file)
+    def __init__(self, video_file: str | PathLike | bytes, audio: bool = True) -> None:
+        if isinstance(video_file, bytes):
+            # imageio는 file-like object를 잘 처리하므로 BytesIO로 감싼다.
+            # 포맷 힌트가 필요할 수 있으므로 format 옵션 등을 고려해야 한다.
+            self.video_file = io.BytesIO(video_file)
+            self._is_bytes = True
+        else:
+            self.video_file = Path(video_file)
+            self._is_bytes = False
+        self._reader = imageio.get_reader(self.video_file, format='mp4') if self._is_bytes else imageio.get_reader(self.video_file)
         meta_data = self._reader.get_meta_data()
         self._fps = meta_data["fps"]
         self._size = meta_data["size"]
