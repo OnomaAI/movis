@@ -22,7 +22,6 @@ from ..imgproc import alpha_composite
 from ..transform import Transform, TransformValue
 from .protocol import AUDIO_BLOCK_SIZE, AUDIO_SAMPLING_RATE, AudioLayer, Layer
 
-
 class Composition:
     """A base layer that integrates multiple layers into one video.
 
@@ -401,6 +400,199 @@ class Composition:
             length = ind_end - ind_start
             audio[:, ind_start:ind_end] += audio_i[:, :length]
         return audio
+
+    def write_raw_video(
+        self,
+        start_time: float = 0.0,
+        end_time: float | None = None,
+        fps: float = 30.0,
+        codec: str = "libx264",
+        pixelformat: str = "yuv420p",
+        audio: bool = True,
+        audio_codec: str = "aac",
+        input_params: list[str] | None = None,
+        output_params: list[str] | None = None,
+        format: str = "mp4",
+    ) -> Iterator[bytes]:
+        """Renders the composition's contents to bytes directly without creating intermediate files.
+
+        Args:
+            start_time: The start time of the video.
+            end_time: The end time of the video.
+            fps: The frame rate of the video.
+            codec: The codec used to encode the video.
+            pixelformat: The pixel format of the video.
+            audio: A flag specifying whether to include audio.
+            audio_codec: The codec used to encode the audio.
+            input_params: Additional parameters for ffmpeg input (video).
+            output_params: Additional parameters for ffmpeg output.
+            format: Container format (e.g., "mp4", "gif"). Defaults to "mp4".
+
+        Returns:
+            bytes: The rendered video file content.
+        """
+        import subprocess
+        import threading
+        import socket
+        from imageio.plugins.ffmpeg import get_exe
+        # AUDIO_SAMPLING_RATE is imported from .protocol usually
+        # If not available in scope, default to 44100 or use explicit import
+        try:
+            from .protocol import AUDIO_SAMPLING_RATE
+        except ImportError:
+            AUDIO_SAMPLING_RATE = 44100
+
+        if end_time is None:
+            end_time = self.duration
+
+        # 1. Prepare Audio Data (in-memory)
+        audio_data = None
+        if audio:
+            # get_audio returns (2, N) float32 array
+            audio_array = self.get_audio(start_time, end_time)
+            if audio_array is not None:
+                # Transpose to (N, 2) and convert to raw bytes (float32 little-endian)
+                audio_data = audio_array.transpose().astype(np.float32).tobytes()
+
+        # 2. Setup Local Socket for Audio Streaming
+        # Since we cannot easily pipe two input streams via stdin, we use a TCP socket for audio.
+        server_socket = None
+        audio_thread = None
+        audio_url = None
+
+        if audio_data is not None:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Bind to localhost with an ephemeral port
+            server_socket.bind(('127.0.0.1', 0))
+            server_socket.listen(1)
+            port = server_socket.getsockname()[1]
+            audio_url = f'tcp://127.0.0.1:{port}'
+
+            def feed_audio():
+                try:
+                    conn, _ = server_socket.accept()
+                    with conn:
+                        conn.sendall(audio_data)
+                        conn.shutdown(socket.SHUT_WR)
+                except Exception:
+                    pass
+
+            audio_thread = threading.Thread(target=feed_audio, daemon=True)
+            audio_thread.start()
+
+        # 3. Construct FFmpeg Command
+        cmd = [get_exe(), '-y']
+
+        # Input 0: Video (Raw frames via stdin)
+        if input_params:
+            cmd.extend(input_params)
+        
+        cmd.extend([
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{self.size[0]}x{self.size[1]}',
+            '-pix_fmt', 'rgba',  # movis renders in RGBA
+            '-r', str(fps),
+            '-i', '-',  # Read from stdin
+        ])
+
+        # Input 1: Audio (Raw samples via TCP)
+        if audio_url:
+            cmd.extend([
+                '-f', 'f32le',       # Float 32-bit Little Endian
+                '-ar', str(AUDIO_SAMPLING_RATE),
+                '-ac', '2',          # Stereo
+                '-i', audio_url
+            ])
+
+        # Output configuration
+        if output_params:
+            cmd.extend(output_params)
+        
+        cmd.extend([
+            '-c:v', codec,
+            '-pix_fmt', pixelformat,
+        ])
+        
+        if audio_url:
+            cmd.extend(['-c:a', audio_codec])
+        
+        # Ensure output is streamable (important for bytes/pipes)
+        if format == 'mp4':
+            cmd.extend(['-movflags', 'frag_keyframe+empty_moov'])
+        
+        cmd.extend([
+            '-f', format,
+            '-'  # Write to stdout
+        ])
+
+        # 4. Run FFmpeg and Feed Video Frames
+        process = subprocess.Popen(
+            cmd, 
+            stdin=subprocess.PIPE, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE
+        )
+
+        # 5. Video Feeder Thread Definition
+        # 메인 스레드가 stdout을 읽는 동안, 이 스레드는 stdin에 데이터를 씁니다.
+        video_exception = None
+
+        def feed_video_frames():
+            nonlocal video_exception
+            try:
+                times = np.arange(start_time, end_time, 1.0 / fps)
+                # 진행 상황을 보고 싶다면 tqdm 사용 가능 (stderr로 출력됨)
+                # from tqdm import tqdm
+                # for t in tqdm(times, desc="Rendering"):
+                for t in times:
+                    frame = np.asarray(self(t, bg_color=(0, 0, 0, 255)))
+                    process.stdin.write(frame.tobytes())
+                process.stdin.close()
+            except Exception as e:
+                video_exception = e
+                process.kill()
+
+        video_thread = threading.Thread(target=feed_video_frames)
+        video_thread.start()
+        
+        # 6. Output Generator Loop (Main Thread)
+        try:
+            while True:
+                # chunk_size 만큼 읽어서 yield
+                chunk = process.stdout.read(chunk_size)
+                if not chunk:
+                    # 프로세스가 종료되었고 더 이상 읽을 데이터가 없으면 루프 탈출
+                    if process.poll() is not None:
+                        break
+                    # 데이터는 없는데 프로세스는 살아있다면 잠시 대기하거나 loop 계속
+                    continue
+                yield chunk
+                
+        except GeneratorExit:
+            # Generator가 외부에서 close() 되었을 때 정리
+            process.kill()
+            raise
+        except Exception as e:
+            process.kill()
+            raise e
+        finally:
+            # 7. Cleanup
+            process.wait()
+            video_thread.join()
+            if server_socket:
+                server_socket.close()
+            if audio_thread:
+                audio_thread.join()
+            
+            # 비디오 스레드에서 에러가 발생했다면 여기서 re-raise
+            if video_exception:
+                raise RuntimeError(f"Video rendering error: {video_exception}")
+            
+            if process.returncode != 0:
+                # stderr 읽기 (이미 파이프가 닫혔을 수도 있음)
+                stderr_out = process.stderr.read()
+                raise RuntimeError(f"FFmpeg returned non-zero code: {process.returncode}\n{stderr_out.decode('utf-8', errors='ignore')}")
 
     def _write_video(
         self, start_time: float, end_time: float,
